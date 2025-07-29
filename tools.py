@@ -1,7 +1,7 @@
 from langchain_core.tools import tool
 from db import get_db_connection
 from typing import Optional, List, Dict, Any
-
+from semantic_search import semantic_search
 #
 # @tool
 # def list_products_by_category(category_name: str) -> str:
@@ -198,7 +198,7 @@ def query_products(
         information instead of generating or guessing product details.
 
         Parameters:
-        - category (str, optional): Filter products by category name (e.g., "shoes", "laptops").
+        - category (str, optional): Filter products by category name (e.g., "men-shoes", "laptops").
         - brand (str, optional): Filter products by brand name (e.g., "Nike", "Apple").
         - gender (str, optional): Filter products by gender specification (e.g., "men", "women").
         - size (str, optional): Filter products by size (e.g., "M", "10").
@@ -287,7 +287,7 @@ def query_products(
         print("🔍 Tool Output (query_products):", results)
 
         if not results:
-            return "NO_RESULTS"
+            return []
         return results
 
 
@@ -379,37 +379,9 @@ def get_product_details(product_name: str, include_images: bool = False) -> str:
     except Exception as e:
         return f"Error: {str(e)}"
 
-#--------------------------------------------------------------------------------------------------------------------------------
-# tools.py
-from sentence_transformers import SentenceTransformer
 
+@tool
+def semantic_search_tool(query: str, top_k: int = 3) -> list[dict]:
+    """Semantic search for products based on a free-text query."""
+    return semantic_search(query, top_k)
 
-model = SentenceTransformer("all-MiniLM-L6-v2")  # Fast and efficient
-
-def build_sentence(product: Dict) -> str:
-    return (
-        f"{product['brand']} {product['product_name']} for {product['gender']} - "
-        f"Size {product['size']}, Color: {product['color']}. "
-        f"Price: ${product['price']}. Category: {product['category']}. "
-        f"Description: {product['description']}"
-    )
-
-def embed_products(products: List[Dict]) -> List[Dict]:
-    sentences = [build_sentence(p) for p in products]
-    embeddings = model.encode(sentences)
-    for i, embedding in enumerate(embeddings):
-        products[i]["embedding"] = embedding
-    return products
-from numpy import dot
-from numpy.linalg import norm
-import numpy as np
-
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    return dot(a, b) / (norm(a) * norm(b))
-
-def semantic_search(user_query: str, products: List[Dict], top_k: int = 5) -> List[Dict]:
-    query_embedding = model.encode(user_query)
-    for product in products:
-        product["score"] = cosine_similarity(query_embedding, product["embedding"])
-    sorted_products = sorted(products, key=lambda x: x["score"], reverse=True)
-    return sorted_products[:top_k]

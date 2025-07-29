@@ -3,6 +3,7 @@ from langchain.chat_models import init_chat_model
 from langgraph.prebuilt import ToolNode
 from langgraph.graph import StateGraph, START, END
 from db import get_all_categories_and_brands
+from langchain_core.messages import HumanMessage
 
 from tools import (
     # list_products_by_category,
@@ -12,7 +13,8 @@ from tools import (
     # filter_products_by_price,
     # search_by_size_and_category,
     # get_product_images,
-    query_products
+    query_products,
+    semantic_search_tool
 )
 
 # Initialize the LLM model
@@ -27,7 +29,8 @@ llm = llm.bind_tools([
     # filter_products_by_price,
     # search_by_size_and_category,
     # get_product_images,
-    query_products
+    query_products,
+    semantic_search_tool
 ])
 
 
@@ -62,7 +65,10 @@ You MUST NOT answer any product-related queries without calling the `query_produ
 3. list_brands_by_category(category_name)
     - Use this to help the user choose a brand in a given category.
     - Only if they ask for brand options or you're unsure what brand to filter by.
-
+4. semantic_search(query, top_k=3)
+    - Use this when the user provides unstructured, vague, or natural language queries that don't specify exact filters (e.g., "something elegant", "a cool outfit", "shoes that go with jeans").
+    - Never use this when structured filters like category and brand are available.
+    - Return only the top 3 most relevant product results based on meaning.
 ---
 
 📌 Decision Rules:
@@ -81,6 +87,7 @@ For all these requests, you must:
 
 - You must **always use tools** for product information. Never guess or generate product data.
 - If the user's message is ambiguous (e.g., "show me shirts"), use `query_products` with just the category.
+- If the user's message is ambiguous or vague (e.g., "show me something nice"), call `semantic_search`.
 - If the user asks for more info about a known product, use `get_product_details` with the exact name.
 - If you're unsure which brand to search for in a category, call `list_brands_by_category` first.
 - Always provide **3 products at most** unless the user asks for more.
@@ -89,6 +96,12 @@ For all these requests, you must:
 
 📊 Available Categories: {', '.join(categories)}
 🏷️ Available Brands: {', '.join(brands)}
+
+IMPORTANT: You must NOT generate or infer any product information on your own.  
+You can only repeat and explain the data that comes directly from the tools.  
+If the tools return no data, respond only with:  
+"I'm sorry, I couldn't find any matching products in our database."
+Do NOT make up product names, descriptions, or prices under any circumstances.
 
 Your goal is to use tools correctly and only reply based on what the tools return.
 """
@@ -105,9 +118,11 @@ def llm_node(state):
 # Router: decides whether to call tools node or end
 def router(state):
     last_message = state['messages'][-1]
-
-    if getattr(last_message, 'tool_calls', None):
-        return 'tools'  # product-related, call tools
+    print("[Router Debug] Last message:", last_message)
+    tool_calls = getattr(last_message, 'tool_calls', None)
+    print("[Router Debug] Tool calls:", tool_calls)
+    if tool_calls:
+        return 'tools'
     else:
         return 'end'
 
@@ -121,14 +136,16 @@ tool_node = ToolNode([
     # filter_products_by_price,
     # search_by_size_and_category,
     # get_product_images,
-    query_products
+    query_products,
+    semantic_search_tool
 ])
 
 # Tools node: executes tool calls and returns updated messages
 def tools_node(state):
+    print("[Tools Node] Invoked")
     result = tool_node.invoke(state)
+    print("[Tools Node] Result messages count:", len(result['messages']))
     return {'messages': state['messages'] + result['messages']}
-
 # Build the LangGraph state machine
 builder = StateGraph(ChatState)
 builder.add_node('llm', llm_node)
@@ -157,7 +174,7 @@ if __name__ == "__main__":
             break
 
         # Add user message to the conversation state
-        state['messages'].append({'role': 'user', 'content': user_input})
+        state['messages'].append(HumanMessage(content=user_input))
 
         # Run the LangGraph pipeline (LLM + tools)
         state = graph.invoke(state)
@@ -165,25 +182,4 @@ if __name__ == "__main__":
         # Print assistant's response
         print(state['messages'][-1].content, "\n")
 
-# from db import fetch_all_products
-# from tools import embed_products, semantic_search, build_sentence
-#
-# print("🔄 Fetching product data from database...")
-# products = fetch_all_products()
-#
-# print("🧠 Generating sentence embeddings...")
-# embedded_products = embed_products(products)
-#
-# while True:
-#     query = input("\n💬 Ask me for a product (or 'quit'): ")
-#     if query.lower() == "quit":
-#         break
-#
-#     print("🔍 Searching...")
-#     results = semantic_search(query, embedded_products)
-#     for idx, r in enumerate(results, 1):
-#         print(f"\n#{idx}: {r['product_name']} ({r['brand']})")
-#         print(f"Category: {r['category']} | Gender: {r['gender']} | Price: ${r['price']}")
-#         print(f"Score: {r['score']:.4f}")
-#         print(f"→ {build_sentence(r)}")
 
