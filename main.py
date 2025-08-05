@@ -4,6 +4,7 @@ from langgraph.prebuilt import ToolNode
 from langgraph.graph import StateGraph, START, END
 from db import get_all_categories_and_brands
 from langchain_core.messages import HumanMessage
+import json
 
 from tools import (
     # list_products_by_category,
@@ -139,13 +140,52 @@ tool_node = ToolNode([
     query_products,
     semantic_search_tool
 ])
+from langchain_core.messages import AIMessage
 
-# Tools node: executes tool calls and returns updated messages
 def tools_node(state):
     print("[Tools Node] Invoked")
     result = tool_node.invoke(state)
-    print("[Tools Node] Result messages count:", len(result['messages']))
-    return {'messages': state['messages'] + result['messages']}
+    new_messages = result['messages']
+    last_tool_response = new_messages[-1]
+
+    # Try to parse tool output
+    should_fallback = False
+    tool_response_data = None
+    last_tool_call = next(
+        (msg.tool_calls[0] for msg in reversed(state['messages']) if hasattr(msg, "tool_calls")),
+        None
+    )
+    last_tool_name = last_tool_call["name"] if last_tool_call else None
+
+    try:
+        tool_response_data = json.loads(last_tool_response.content)
+        print("🔧 Parsed tool response:", tool_response_data)
+
+        # Handle structured response from query_products
+        if last_tool_name == "query_products":
+            status = tool_response_data.get("status")
+
+            if status == "empty":
+                should_fallback = True
+            elif status == "end_of_list":
+                new_messages.append(AIMessage(content="That's all the products we have in this category."))
+
+    except Exception as e:
+        print("⚠️ Failed to parse tool response:", e)
+
+    if should_fallback:
+        print("[Fallback Triggered] Running semantic_search...")
+        user_message = next(
+            (msg for msg in reversed(state['messages']) if msg.type == "human"),
+            None
+        )
+        if user_message:
+            fallback_response = semantic_search_tool.invoke({"query": user_message.content})
+            new_messages.append(fallback_response)
+
+    return {"messages": state["messages"] + new_messages}
+
+
 # Build the LangGraph state machine
 builder = StateGraph(ChatState)
 builder.add_node('llm', llm_node)

@@ -285,10 +285,25 @@ def query_products(
             images_str = product.get('images', '')
             product['images'] = [img.strip() for img in images_str.split(',')] if images_str else []
         print("🔍 Tool Output (query_products):", results)
-
         if not results:
-            return []
-        return results
+            if offset > 0:
+                return {
+                    "status": "end_of_list",
+                    "message": "That's all the products we have in this category.",
+                    "results": []
+                }
+            else:
+                return {
+                    "status": "empty",
+                    "message": "No matching products found for your filters.",
+                    "results": []
+                }
+
+        return {
+            "status": "success",
+            "results": results
+        }
+
 
 
     except Exception as e:
@@ -380,8 +395,27 @@ def get_product_details(product_name: str, include_images: bool = False) -> str:
         return f"Error: {str(e)}"
 
 
+
+
 @tool
-def semantic_search_tool(query: str, top_k: int = 3) -> list[dict]:
+def semantic_search_tool(query: str, top_k: int = 3) -> str:
     """Semantic search for products based on a free-text query."""
-    return semantic_search(query, top_k)
+    results = semantic_search(query, top_k)
+
+    if not results:
+        return "I'm sorry, I couldn't find any matching products."
+
+    output = "🧠 Based on your query, here are some products I found:\n\n"
+    for product in results:
+        output += (
+            f"🛍️ {product['product_name']} ({product['brand']})\n"
+            f"👕 Category: {product['category']}\n"
+            f"💰 Price: ${product['price']}\n"
+            f"📦 Size: {product['size']} | Color: {product['color']}\n"
+            f"🧾 Description: {product['description']}\n\n"
+        )
+
+    return output.strip()
+
+
 
