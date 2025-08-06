@@ -1,6 +1,8 @@
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # Suppress warnings and info messages (0=all,1=info,2=warning,3=error)
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+import logging
+logging.getLogger("httpx").setLevel(logging.WARNING)
 from typing import TypedDict
 from langchain.chat_models import init_chat_model
 from langgraph.prebuilt import ToolNode
@@ -98,6 +100,7 @@ IMPORTANT: You must NOT generate or infer any product information on your own.
 You can only repeat and explain the data that comes directly from the tools.  
 If the tools return no data, respond only with:  
 "I'm sorry, I couldn't find any matching products in our database."
+If you couldn't found any products in the database using the query_products tool, use directly the semantic_search tool.
 Do NOT make up product names, descriptions, or prices under any circumstances.
 
 Your goal is to use tools correctly and only reply based on what the tools return.
@@ -146,33 +149,38 @@ def retry_tool_call(tool_node, state, max_retries=3, delay=1):
             time.sleep(delay)
     raise RuntimeError(f"Tool call failed after {max_retries} attempts") from last_exception
 
-
 def tools_node(state):
     print("[Tools Node] Invoked")
-    # 🔁 Retry tool call
     try:
         result = retry_tool_call(tool_node, state)
     except Exception as e:
         print("❌ Tool call ultimately failed after retries:", e)
-        return {"messages": state["messages"] + [AIMessage(content="Something went wrong while fetching the product information. Please try again.")]}
+        return {
+            "messages": state["messages"] + [
+                AIMessage(content="Something went wrong while fetching the product information. Please try again.")
+            ]
+        }
 
-    new_messages = result['messages']
-    last_tool_response = new_messages[-1]
+    new_messages = result["messages"]
+    last_tool_response = new_messages[-1] if new_messages else None
 
     should_fallback = False
     tool_response_data = None
 
     last_tool_call = next(
-        (msg.tool_calls[0] for msg in reversed(state['messages']) if hasattr(msg, "tool_calls")),
+        (
+            msg.tool_calls[0]
+            for msg in reversed(state["messages"])
+            if hasattr(msg, "tool_calls") and msg.tool_calls
+        ),
         None
     )
     last_tool_name = last_tool_call["name"] if last_tool_call else None
 
     try:
-        tool_response_data = last_tool_response.content
+        tool_response_data = getattr(last_tool_response, "content", None)
         print("🔧 Raw tool response:", tool_response_data)
 
-        # Attempt to parse JSON if it's a string
         if isinstance(tool_response_data, str):
             try:
                 tool_response_data = json.loads(tool_response_data)
@@ -182,17 +190,14 @@ def tools_node(state):
 
         print("🔧 Parsed tool response:", tool_response_data)
 
-        # Process tool logic based on tool name
         if last_tool_name == "query_products":
             status = tool_response_data.get("status")
-
             if status == "empty":
                 should_fallback = True
             elif status == "end_of_list":
                 print("That's all the products we have in this category.")
-                new_messages.append(
-                    AIMessage(content="That's all the products we have in this category.")
-                )
+                additional_message = AIMessage(content="That's all the products we have in this category.")
+                new_messages.append(additional_message)
 
     except Exception as e:
         print("⚠️ Failed to parse tool response:", e)
@@ -200,14 +205,16 @@ def tools_node(state):
     if should_fallback:
         print("[Fallback Triggered] Running semantic_search...")
         user_message = next(
-            (msg for msg in reversed(state['messages']) if isinstance(msg, HumanMessage)),
+            (msg for msg in reversed(state["messages"]) if isinstance(msg, HumanMessage)),
             None
         )
         if user_message:
+            print("[Semantic Search Query]:", user_message.content)
             fallback_response = semantic_search_tool.invoke({"query": user_message.content})
             new_messages.append(fallback_response)
 
     return {"messages": state["messages"] + new_messages}
+
 
 
 
