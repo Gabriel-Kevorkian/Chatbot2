@@ -2,6 +2,9 @@ from langchain_core.tools import tool
 from db import get_db_connection
 from typing import Optional, List, Dict, Any
 from semantic_search import semantic_search
+import json
+from decimal import Decimal
+
 #
 # @tool
 # def list_products_by_category(category_name: str) -> str:
@@ -282,27 +285,37 @@ def query_products(
         results = cursor.fetchall()
 
         for product in results:
-            images_str = product.get('images', '')
-            product['images'] = [img.strip() for img in images_str.split(',')] if images_str else []
+            # Fix Decimal serialization
+            if isinstance(product.get('price'), Decimal):
+                product['price'] = float(product['price'])
+
+            # Fix image list
+            images_raw = product.get('images', '')
+            try:
+                product['images'] = json.loads(images_raw)
+            except Exception:
+                product['images'] = []
+
         print("🔍 Tool Output (query_products):", results)
         if not results:
             if offset > 0:
-                return {
+                return json.dumps({
                     "status": "end_of_list",
                     "message": "That's all the products we have in this category.",
                     "results": []
-                }
+                })
             else:
-                return {
+                return json.dumps({
                     "status": "empty",
                     "message": "No matching products found for your filters.",
                     "results": []
-                }
+                })
 
-        return {
+        return json.dumps({
             "status": "success",
             "results": results
-        }
+        })
+
 
 
 

@@ -92,7 +92,8 @@ For all these requests, you must:
 - If the user asks for more info about a known product, use `get_product_details` with the exact name.
 - If you're unsure which brand to search for in a category, call `list_brands_by_category` first.
 - Always provide **3 products at most** unless the user asks for more.
-
+- If the user ask for shoes or shirts always ask if for women or men.
+- If the user ask for "cars" search in the vehicle category.
 ---
 
 📊 Available Categories: {', '.join(categories)}
@@ -141,16 +142,15 @@ tool_node = ToolNode([
     semantic_search_tool
 ])
 from langchain_core.messages import AIMessage
-
 def tools_node(state):
     print("[Tools Node] Invoked")
     result = tool_node.invoke(state)
     new_messages = result['messages']
     last_tool_response = new_messages[-1]
 
-    # Try to parse tool output
     should_fallback = False
     tool_response_data = None
+
     last_tool_call = next(
         (msg.tool_calls[0] for msg in reversed(state['messages']) if hasattr(msg, "tool_calls")),
         None
@@ -158,17 +158,30 @@ def tools_node(state):
     last_tool_name = last_tool_call["name"] if last_tool_call else None
 
     try:
-        tool_response_data = json.loads(last_tool_response.content)
+        tool_response_data = last_tool_response.content
+        print("🔧 Raw tool response:", tool_response_data)
+
+        # Attempt to parse JSON if it's a string
+        if isinstance(tool_response_data, str):
+            try:
+                tool_response_data = json.loads(tool_response_data)
+            except json.JSONDecodeError as e:
+                print("⚠️ JSON decode error:", e)
+                tool_response_data = {}
+
         print("🔧 Parsed tool response:", tool_response_data)
 
-        # Handle structured response from query_products
+        # Process tool logic based on tool name
         if last_tool_name == "query_products":
             status = tool_response_data.get("status")
 
             if status == "empty":
                 should_fallback = True
             elif status == "end_of_list":
-                new_messages.append(AIMessage(content="That's all the products we have in this category."))
+                print("That's all the products we have in this category.")
+                new_messages.append(
+                    AIMessage(content="That's all the products we have in this category.")
+                )
 
     except Exception as e:
         print("⚠️ Failed to parse tool response:", e)
@@ -184,6 +197,7 @@ def tools_node(state):
             new_messages.append(fallback_response)
 
     return {"messages": state["messages"] + new_messages}
+
 
 
 # Build the LangGraph state machine
