@@ -311,9 +311,19 @@ def query_products(
                     "results": []
                 })
 
+        concise_results = []
+        for p in results:
+            concise_results.append({
+                "name": p["name"],
+                "price": float(p["price"]),
+                "color": p.get("color", ""),
+                "size": p.get("size", ""),
+                "in_stock": p.get("in_stock", False),
+                "image": p.get("images", [""])[0] if p.get("images") else ""
+            })
         return json.dumps({
             "status": "success",
-            "results": results
+            "results": concise_results
         })
 
 

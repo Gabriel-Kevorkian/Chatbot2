@@ -1,3 +1,6 @@
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # Suppress warnings and info messages (0=all,1=info,2=warning,3=error)
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 from typing import TypedDict
 from langchain.chat_models import init_chat_model
 from langgraph.prebuilt import ToolNode
@@ -5,15 +8,13 @@ from langgraph.graph import StateGraph, START, END
 from db import get_all_categories_and_brands
 from langchain_core.messages import HumanMessage
 import json
+from langchain_core.messages import AIMessage
+import time
+
 
 from tools import (
-    # list_products_by_category,
     list_brands_by_category,
-    # search_products,
     get_product_details,
-    # filter_products_by_price,
-    # search_by_size_and_category,
-    # get_product_images,
     query_products,
     semantic_search_tool
 )
@@ -23,13 +24,8 @@ llm = init_chat_model("qwen2.5:7b-instruct-q4_K_M", model_provider="ollama")
 
 # Bind all tools to the LLM
 llm = llm.bind_tools([
-    # list_products_by_category,
     list_brands_by_category,
-    # search_products,
     get_product_details,
-    # filter_products_by_price,
-    # search_by_size_and_category,
-    # get_product_images,
     query_products,
     semantic_search_tool
 ])
@@ -39,7 +35,6 @@ llm = llm.bind_tools([
 class ChatState(TypedDict):
     messages: list
 
-# LLM node: invokes the LLM on conversation messages
 # Outside llm_node, after fetching categories and brands:
 categories, brands = get_all_categories_and_brands()
 
@@ -117,6 +112,7 @@ def llm_node(state):
     messages_with_system = [system_message] + state['messages']
     response = llm.invoke(messages_with_system)
     return {'messages': state['messages'] + [response]}
+
 # Router: decides whether to call tools node or end
 def router(state):
     last_message = state['messages'][-1]
@@ -131,20 +127,35 @@ def router(state):
 
 # ToolNode setup with all your tools
 tool_node = ToolNode([
-    # list_products_by_category,
     list_brands_by_category,
-    # search_products,
     get_product_details,
-    # filter_products_by_price,
-    # search_by_size_and_category,
-    # get_product_images,
     query_products,
     semantic_search_tool
 ])
-from langchain_core.messages import AIMessage
+
+def retry_tool_call(tool_node, state, max_retries=3, delay=1):
+    last_exception = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"[Retry] Attempt {attempt}...")
+            result = tool_node.invoke(state)
+            return result
+        except Exception as e:
+            last_exception = e
+            print(f"⚠️ Tool call failed (Attempt {attempt}): {e}")
+            time.sleep(delay)
+    raise RuntimeError(f"Tool call failed after {max_retries} attempts") from last_exception
+
+
 def tools_node(state):
     print("[Tools Node] Invoked")
-    result = tool_node.invoke(state)
+    # 🔁 Retry tool call
+    try:
+        result = retry_tool_call(tool_node, state)
+    except Exception as e:
+        print("❌ Tool call ultimately failed after retries:", e)
+        return {"messages": state["messages"] + [AIMessage(content="Something went wrong while fetching the product information. Please try again.")]}
+
     new_messages = result['messages']
     last_tool_response = new_messages[-1]
 
@@ -189,7 +200,7 @@ def tools_node(state):
     if should_fallback:
         print("[Fallback Triggered] Running semantic_search...")
         user_message = next(
-            (msg for msg in reversed(state['messages']) if msg.type == "human"),
+            (msg for msg in reversed(state['messages']) if isinstance(msg, HumanMessage)),
             None
         )
         if user_message:

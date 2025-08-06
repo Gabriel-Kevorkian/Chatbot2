@@ -38,7 +38,7 @@ def build_faiss_index():
 
     print(f"🔄 Indexed {len(products)} products into FAISS.")
 
-def semantic_search(query: str, top_k: int = 3, threshold: float = 0.8) -> List[Dict]:
+def semantic_search(query: str, top_k: int = 3, threshold: float = 0.6) -> List[Dict]:
     if not os.path.exists(INDEX_FILE) or not os.path.exists(META_FILE):
         build_faiss_index()
 
