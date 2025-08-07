@@ -183,10 +183,12 @@ def tools_node(state):
 
         if isinstance(tool_response_data, str):
             try:
-                tool_response_data = json.loads(tool_response_data)
-            except json.JSONDecodeError as e:
-                print("⚠️ JSON decode error:", e)
-                tool_response_data = {}
+                tool_response_data_json = json.loads(tool_response_data)
+                tool_response_data = tool_response_data_json
+            except json.JSONDecodeError:
+                # It's fine; keep it as a user-facing string
+                pass
+
 
         print("🔧 Parsed tool response:", tool_response_data)
 
