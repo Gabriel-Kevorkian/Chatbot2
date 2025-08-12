@@ -290,7 +290,7 @@ You are an intelligent and strictly grounded e-commerce assistant.
 
 You help users find and explore products **only from our internal database**, using the following tools:
 You MUST NOT answer any product-related queries without calling the `query_products` tool.
- Never generate product names, descriptions, or prices yourself. Always rely on the database results.
+Never generate product names, descriptions, or prices yourself. Always rely on the database results.
 
 ---
 
@@ -326,6 +326,11 @@ User can ask for more products in many ways, such as:
 For all these requests, you must:
 - Call the `query_products` tool with the same filters but with an increased offset (to fetch the next batch of products).
 - Avoid repeating products already shown.
+
+**IMPORTANT FALLBACK BEHAVIOR:**
+- If you just said "I couldn't find any products matching those specific criteria. Let me try a semantic search to find similar products that might interest you.", you MUST immediately call the `semantic_search_tool` with a natural language query based on the user's original request.
+- Reformulate the user's original product request into a descriptive query for semantic search.
+- For example: if user asked for "red Nike shoes" and structured search failed, use semantic_search_tool with query like "red athletic shoes Nike style" or "red sneakers similar to Nike".
 
 
 - You must **always use tools** for product information. Never guess or generate product data.
@@ -473,7 +478,7 @@ def tools_node(state):
             }
         new_messages = result["messages"]
 
-    # Handle fallback logic (unchanged from original)
+    # Handle fallback logic - but now trigger LLM to call semantic_search instead of doing it directly
     last_tool_response = new_messages[-1] if new_messages else None
     should_fallback = False
     tool_response_data = None
@@ -482,42 +487,43 @@ def tools_node(state):
         tool_response_data = getattr(last_tool_response, "content", None)
         print("🔧 Raw tool response:", tool_response_data)
 
-        if isinstance(tool_response_data, str):
-            try:
-                tool_response_data = json.loads(tool_response_data)
-            except json.JSONDecodeError as e:
-                print("⚠️ JSON decode error:", e)
-                tool_response_data = {}
+        # Only try to parse as JSON for tools that return JSON (not semantic_search)
+        if last_tool_call and last_tool_call["name"] != "semantic_search_tool":
+            if isinstance(tool_response_data, str):
+                try:
+                    tool_response_data = json.loads(tool_response_data)
+                except json.JSONDecodeError as e:
+                    print("⚠️ JSON decode error:", e)
+                    tool_response_data = {}
 
-        print("🔧 Parsed tool response:", tool_response_data)
+            print("🔧 Parsed tool response:", tool_response_data)
 
-        if last_tool_call and last_tool_call["name"] == "query_products":
-            status = tool_response_data.get("status")
-            if status == "empty":
-                should_fallback = True
-            elif status == "end_of_list":
-                print("That's all the products we have in this category.")
-                additional_message = AIMessage(content="That's all the products we have in this category.")
-                new_messages.append(additional_message)
+            if last_tool_call["name"] == "query_products":
+                status = tool_response_data.get("status")
+                if status == "empty":
+                    should_fallback = True
+                elif status == "end_of_list":
+                    print("That's all the products we have in this category.")
+                    additional_message = AIMessage(content="That's all the products we have in this category.")
+                    new_messages.append(additional_message)
+        else:
+            # For semantic_search_tool, the response is already formatted, no JSON parsing needed
+            print("🔧 Semantic search response (no parsing needed):", tool_response_data)
 
     except Exception as e:
         print("⚠️ Failed to parse tool response:", e)
 
+    # Modified fallback logic - add a special message to trigger semantic search
     if should_fallback:
-        print("[Fallback Triggered] Running semantic_search...")
-        user_message = next(
-            (msg for msg in reversed(state["messages"]) if isinstance(msg, HumanMessage)),
-            None
+        print("[Fallback Triggered] Prompting LLM to use semantic_search...")
+
+        # Add a special system-like message that instructs the LLM to use semantic_search
+        fallback_instruction = AIMessage(
+            content="I couldn't find any products matching those specific criteria. Let me try a semantic search to find similar products that might interest you."
         )
-        if user_message:
-            print("[Semantic Search Query]:", user_message.content)
-            fallback_result = cached_semantic_search.invoke({"query": user_message.content})
-            from langchain_core.messages import ToolMessage
-            fallback_message = ToolMessage(
-                content=json.dumps(fallback_result) if not isinstance(fallback_result, str) else fallback_result,
-                tool_call_id="fallback_semantic_search"
-            )
-            new_messages.append(fallback_message)
+
+        # Add this instruction message to trigger the LLM to make a semantic search call
+        new_messages.append(fallback_instruction)
 
     return {"messages": state["messages"] + new_messages}
 
