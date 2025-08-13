@@ -3,24 +3,18 @@ import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # Suppress warnings and info messages (0=all,1=info,2=warning,3=error)
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 import logging
-
 logging.getLogger("httpx").setLevel(logging.WARNING)
-from typing import TypedDict
+from typing import TypedDict,Optional
 from langchain.chat_models import init_chat_model
 from langgraph.prebuilt import ToolNode
 from langgraph.graph import StateGraph, START, END
 from db import get_all_categories_and_brands
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, ToolMessage
 import json
 from langchain_core.messages import AIMessage
 import time
-import hashlib
-import pickle
-import sqlite3
-from pathlib import Path
-from datetime import datetime, timedelta
-import threading
-
+from datetime import datetime
+from conversation_manager import ConversationManager,ConversationStateManager
 from tools import (
     list_brands_by_category,
     get_product_details,
@@ -29,231 +23,12 @@ from tools import (
 )
 
 
-# ===================== CACHING SYSTEM =====================
-
-class ChatbotCache:
-    def __init__(self, cache_dir="chatbot_cache", db_name="cache.db", expire_minutes=5):
-        self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(exist_ok=True)
-        self.db_path = self.cache_dir / db_name
-        self.expire_minutes = expire_minutes
-        self.lock = threading.Lock()
-        self._init_db()
-
-    def _adapt_datetime(self, dt):
-        """Convert datetime to ISO format string for SQLite"""
-        return dt.isoformat()
-
-    def _convert_datetime(self, s):
-        """Convert ISO format string back to datetime"""
-        return datetime.fromisoformat(s.decode('utf-8') if isinstance(s, bytes) else s)
-
-    def _init_db(self):
-        """Initialize SQLite database for caching"""
-        # Register datetime converters for Python 3.12+ compatibility
-        sqlite3.register_adapter(datetime, self._adapt_datetime)
-        sqlite3.register_converter("timestamp", self._convert_datetime)
-
-        with sqlite3.connect(self.db_path, detect_types=sqlite3.PARSE_DECLTYPES) as conn:
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS tool_cache (
-                    id INTEGER PRIMARY KEY,
-                    cache_key TEXT UNIQUE,
-                    tool_name TEXT,
-                    result BLOB,
-                    created_at TEXT,
-                    expires_at TEXT
-                )
-            ''')
-
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS llm_cache (
-                    id INTEGER PRIMARY KEY,
-                    message_hash TEXT UNIQUE,
-                    response BLOB,
-                    created_at TEXT,
-                    expires_at TEXT
-                )
-            ''')
-
-            conn.execute('''
-                CREATE INDEX IF NOT EXISTS idx_tool_cache_key ON tool_cache(cache_key)
-            ''')
-
-            conn.execute('''
-                CREATE INDEX IF NOT EXISTS idx_llm_hash ON llm_cache(message_hash)
-            ''')
-
-            conn.execute('''
-                CREATE INDEX IF NOT EXISTS idx_tool_expires ON tool_cache(expires_at)
-            ''')
-
-            conn.execute('''
-                CREATE INDEX IF NOT EXISTS idx_llm_expires ON llm_cache(expires_at)
-            ''')
-
-    def _generate_cache_key(self, tool_name: str, **kwargs) -> str:
-        """Generate a unique cache key for tool calls"""
-        # Sort and filter out None values for consistent caching
-        filtered_kwargs = {k: v for k, v in kwargs.items() if v is not None}
-        key_data = f"{tool_name}_{json.dumps(filtered_kwargs, sort_keys=True)}"
-        return hashlib.md5(key_data.encode()).hexdigest()
-
-    def _generate_message_hash(self, messages: list) -> str:
-        """Generate hash for message sequence"""
-        # Only hash the last few messages to avoid cache misses due to long conversations
-        recent_messages = messages[-2:] if len(messages) > 2 else messages
-        message_content = []
-
-        for msg in recent_messages:
-            msg_type = getattr(msg, 'type', 'unknown')
-            content = getattr(msg, 'content', '')
-
-            # For tool calls, include tool name and args for better cache granularity
-            if hasattr(msg, 'tool_calls') and msg.tool_calls:
-                for tool_call in msg.tool_calls:
-                    content += f"_TOOL:{tool_call['name']}:{json.dumps(tool_call['args'], sort_keys=True)}"
-
-            message_content.append({"role": msg_type, "content": content})
-
-        message_str = json.dumps(message_content, sort_keys=True)
-        return hashlib.md5(message_str.encode()).hexdigest()
-
-    def get_tool_result(self, tool_name: str, **kwargs):
-        """Get cached tool result"""
-        cache_key = self._generate_cache_key(tool_name, **kwargs)
-        current_time = datetime.now().isoformat()
-
-        with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.execute('''
-                    SELECT result FROM tool_cache 
-                    WHERE cache_key = ? AND expires_at > ?
-                ''', (cache_key, current_time))
-
-                row = cursor.fetchone()
-                if row:
-                    print(f"🚀 Cache HIT for {tool_name}")
-                    return pickle.loads(row[0])
-
-        print(f"💾 Cache MISS for {tool_name}")
-        return None
-
-    def store_tool_result(self, tool_name: str, result, **kwargs):
-        """Store tool result in cache"""
-        cache_key = self._generate_cache_key(tool_name, **kwargs)
-        created_at = datetime.now().isoformat()
-        expires_at = (datetime.now() + timedelta(minutes=self.expire_minutes)).isoformat()
+from chatbot_cache import ChatbotCache,CachedToolWrapper
 
 
-        with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute('''
-                    INSERT OR REPLACE INTO tool_cache 
-                    (cache_key, tool_name, result, created_at, expires_at)
-                    VALUES (?, ?, ?, ?, ?)
-                ''', (cache_key, tool_name, pickle.dumps(result), created_at, expires_at))
+conversation_manager = ConversationManager()
+conv_state_manager = ConversationStateManager()
 
-    def get_llm_response(self, messages: list):
-        """Get cached LLM response"""
-        message_hash = self._generate_message_hash(messages)
-        current_time = datetime.now().isoformat()
-
-        with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.execute('''
-                    SELECT response FROM llm_cache 
-                    WHERE message_hash = ? AND expires_at > ?
-                ''', (message_hash, current_time))
-
-                row = cursor.fetchone()
-                if row:
-                    print("🚀 Cache HIT for LLM response")
-                    return pickle.loads(row[0])
-
-        print("💾 Cache MISS for LLM response")
-        return None
-
-    def store_llm_response(self, messages: list, response):
-        """Store LLM response in cache"""
-        message_hash = self._generate_message_hash(messages)
-        created_at = datetime.now().isoformat()
-        expires_at = (datetime.now() + timedelta(minutes=self.expire_minutes)).isoformat()
-
-        with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute('''
-                    INSERT OR REPLACE INTO llm_cache 
-                    (message_hash, response, created_at, expires_at)
-                    VALUES (?, ?, ?, ?)
-                ''', (message_hash, pickle.dumps(response), created_at, expires_at))
-
-    def clear_expired(self):
-        """Clear expired cache entries"""
-        current_time = datetime.now().isoformat()
-
-        with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
-                tool_deleted = conn.execute('DELETE FROM tool_cache WHERE expires_at < ?', (current_time,)).rowcount
-                llm_deleted = conn.execute('DELETE FROM llm_cache WHERE expires_at < ?', (current_time,)).rowcount
-                print(f"🧹 Cleared {tool_deleted} expired tool entries and {llm_deleted} expired LLM entries")
-
-    def clear_all(self):
-        """Clear all cache entries"""
-        with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
-                tool_count = conn.execute('SELECT COUNT(*) FROM tool_cache').fetchone()[0]
-                llm_count = conn.execute('SELECT COUNT(*) FROM llm_cache').fetchone()[0]
-                conn.execute('DELETE FROM tool_cache')
-                conn.execute('DELETE FROM llm_cache')
-                print(f"🗑️ Cleared {tool_count} tool entries and {llm_count} LLM entries")
-
-    def get_cache_stats(self):
-        """Get cache statistics"""
-        current_time = datetime.now().isoformat()
-
-        with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
-                tool_active = \
-                conn.execute('SELECT COUNT(*) FROM tool_cache WHERE expires_at > ?', (current_time,)).fetchone()[0]
-                tool_expired = \
-                conn.execute('SELECT COUNT(*) FROM tool_cache WHERE expires_at <= ?', (current_time,)).fetchone()[0]
-                llm_active = \
-                conn.execute('SELECT COUNT(*) FROM llm_cache WHERE expires_at > ?', (current_time,)).fetchone()[0]
-                llm_expired = \
-                conn.execute('SELECT COUNT(*) FROM llm_cache WHERE expires_at <= ?', (current_time,)).fetchone()[0]
-
-                # Get cache hit rates (would need to track this separately for accurate stats)
-                total_size = conn.execute(
-                    'SELECT page_count * page_size as size FROM pragma_page_count(), pragma_page_size()').fetchone()[0]
-
-                return {
-                    "tool_cache_active": tool_active,
-                    "tool_cache_expired": tool_expired,
-                    "llm_cache_active": llm_active,
-                    "llm_cache_expired": llm_expired,
-                    "cache_size_bytes": total_size
-                }
-
-
-# ===================== CACHED TOOLS =====================
-
-class CachedToolWrapper:
-    def __init__(self, tool, cache: ChatbotCache, tool_name: str):
-        self.tool = tool
-        self.cache = cache
-        self.tool_name = tool_name
-
-    def invoke(self, kwargs):
-        # Try to get from cache first
-        cached_result = self.cache.get_tool_result(self.tool_name, **kwargs)
-        if cached_result is not None:
-            return cached_result
-
-        # If not in cache, execute tool and cache result
-        result = self.tool.invoke(kwargs)
-        self.cache.store_tool_result(self.tool_name, result, **kwargs)
-        return result
 
 
 # Initialize cache system
@@ -280,7 +55,7 @@ llm = llm.bind_tools([
 # Define the state schema
 class ChatState(TypedDict):
     messages: list
-
+    conversation_id: Optional[str]
 
 # Outside llm_node, after fetching categories and brands:
 categories, brands = get_all_categories_and_brands()
@@ -358,21 +133,168 @@ Your goal is to use tools correctly and only reply based on what the tools retur
 
 
 def llm_node(state):
-    system_message = {
-        'role': 'system',
-        'content': system_message_content
-    }
-    messages_with_system = [system_message] + state['messages']
+    conversation_id = state.get('conversation_id')
+    if not conversation_id:
+        raise ValueError("conversation_id is required in state")
+
+    # Get conversation-specific messages
+    conversation_messages = conv_state_manager.get_conversation_messages(conversation_id)
+    system_message = {'role': 'system', 'content': system_message_content}
+    messages_with_system = [system_message] + conversation_messages
 
     # Try to get cached LLM response
+    start_time = time.time()
     cached_response = cache.get_llm_response(messages_with_system)
-    if cached_response is not None:
-        return {'messages': state['messages'] + [cached_response]}
+    response_time = time.time() - start_time
 
-    # If not cached, get new response and cache it
+    if cached_response is not None:
+        # Add response to conversation state
+        conv_state_manager.add_message_to_conversation(conversation_id, cached_response)
+
+        # Save to database
+        conversation_manager.save_message(
+            conversation_id,
+            'assistant',
+            cached_response.content,
+            getattr(cached_response, 'tool_calls', None),
+            response_time,
+            cached=True
+        )
+
+        # Return updated state with conversation-specific messages
+        return {
+            'messages': conv_state_manager.get_conversation_messages(conversation_id),
+            'conversation_id': conversation_id
+        }
+
+    # If not cached, get new response
     response = llm.invoke(messages_with_system)
+    response_time = time.time() - start_time
     cache.store_llm_response(messages_with_system, response)
-    return {'messages': state['messages'] + [response]}
+
+    # Add response to conversation state
+    conv_state_manager.add_message_to_conversation(conversation_id, response)
+
+    # Save to database
+    conversation_manager.save_message(
+        conversation_id,
+        'assistant',
+        response.content,
+        getattr(response, 'tool_calls', None),
+        response_time,
+        cached=False
+    )
+
+    return {
+        'messages': conv_state_manager.get_conversation_messages(conversation_id),
+        'conversation_id': conversation_id
+    }
+
+
+def multi_conv_tools_node(state):
+    """Tools node that handles multiple conversations correctly"""
+    conversation_id = state.get('conversation_id')
+    if not conversation_id:
+        raise ValueError("conversation_id is required in state")
+
+    print(f"[Tools Node] Processing for conversation: {conversation_id[:8]}...")
+
+    # Get conversation-specific messages
+    conversation_messages = conv_state_manager.get_conversation_messages(conversation_id)
+
+    # Find the last tool call in this conversation
+    last_tool_call = None
+    for msg in reversed(conversation_messages):
+        if hasattr(msg, "tool_calls") and msg.tool_calls:
+            last_tool_call = msg.tool_calls[0]
+            break
+
+    if not last_tool_call:
+        print("❌ No tool call found")
+        error_message = AIMessage(content="I couldn't process your request. Please try again.")
+        conv_state_manager.add_message_to_conversation(conversation_id, error_message)
+        return {
+            "messages": conv_state_manager.get_conversation_messages(conversation_id),
+            'conversation_id': conversation_id
+        }
+
+    tool_name = last_tool_call["name"]
+    tool_args = last_tool_call["args"]
+
+    print(f"[Tools] Executing {tool_name} with args: {tool_args}")
+
+    # Execute cached tool (same as your original implementation)
+    result = None
+    try:
+        if tool_name == "list_brands_by_category":
+            result = cached_list_brands.invoke(tool_args)
+        elif tool_name == "get_product_details":
+            result = cached_get_product_details.invoke(tool_args)
+        elif tool_name == "query_products":
+            result = cached_query_products.invoke(tool_args)
+        elif tool_name == "semantic_search_tool":
+            result = cached_semantic_search.invoke(tool_args)
+        else:
+            # Fallback to original tool execution
+            temp_state = {"messages": conversation_messages}
+            original_result = retry_tool_call(tool_node, temp_state)
+            result = original_result
+
+    except Exception as e:
+        print(f"❌ Tool execution failed: {e}")
+        error_message = AIMessage(content="I encountered an error while searching. Please try again.")
+        conv_state_manager.add_message_to_conversation(conversation_id, error_message)
+        return {
+            "messages": conv_state_manager.get_conversation_messages(conversation_id),
+            'conversation_id': conversation_id
+        }
+
+    # Create proper tool message
+    if tool_name == "query_products" and isinstance(result, dict):
+        if result.get("status") == "success" and result.get("results"):
+            # Format for better LLM understanding
+            formatted_content = f"Found {len(result['results'])} products:\n"
+            for i, product in enumerate(result["results"], 1):
+                formatted_content += f"{i}. **{product['name']}** - ${product['price']} (Size: {product['size']}, Color: {product['color']})\n"
+            tool_content = formatted_content
+        else:
+            tool_content = json.dumps(result)
+    else:
+        tool_content = json.dumps(result) if not isinstance(result, str) else result
+
+    tool_message = ToolMessage(
+        content=tool_content,
+        tool_call_id=last_tool_call["id"]
+    )
+
+    # Add tool message to conversation
+    conv_state_manager.add_message_to_conversation(conversation_id, tool_message)
+
+    # Handle fallback logic for empty results
+    should_fallback = False
+    if tool_name == "query_products":
+        try:
+            if isinstance(result, str):
+                result_data = json.loads(result)
+            else:
+                result_data = result
+
+            if result_data.get("status") == "empty":
+                should_fallback = True
+                print("[Fallback] Empty query_products result, suggesting semantic search")
+        except Exception as e:
+            print(f"⚠️ Failed to parse tool response: {e}")
+
+    if should_fallback:
+        fallback_instruction = AIMessage(
+            content="I couldn't find any products matching those specific criteria. Let me try a semantic search to find similar products that might interest you."
+        )
+        conv_state_manager.add_message_to_conversation(conversation_id, fallback_instruction)
+
+    return {
+        "messages": conv_state_manager.get_conversation_messages(conversation_id),
+        'conversation_id': conversation_id
+    }
 
 
 # Router: decides whether to call tools node or end
@@ -531,7 +453,7 @@ def tools_node(state):
 # Build the LangGraph state machine
 builder = StateGraph(ChatState)
 builder.add_node('llm', llm_node)
-builder.add_node('tools', tools_node)
+builder.add_node('tools', multi_conv_tools_node)
 builder.add_edge(START, 'llm')
 builder.add_edge('tools', 'llm')
 builder.add_conditional_edges('llm', router, {
@@ -543,39 +465,151 @@ graph = builder.compile()
 
 # Main interactive loop with cache management
 if __name__ == "__main__":
-    state = {'messages': []}
-    print("Welcome to your Enhanced E-Commerce Assistant with Caching! 🚀")
-    print("Type your question, 'cache_stats' to see cache info, 'clear_cache' to clear cache, or 'quit' to exit.\n")
+    """Main function that handles multiple conversations correctly"""
+    print("🚀 Welcome to your Multi-Conversation E-Commerce Assistant!")
+    print("Each session gets its own conversation ID and message history.")
+    print("Commands: 'cache_stats', 'conv_stats', 'active_convs', 'switch_conv <id>', 'clear_cache', 'debug', 'quit'")
+    print()
 
-    while True:
-        user_input = input("> ")
-        if user_input.lower() == 'quit':
-            print("Goodbye!")
-            break
-        elif user_input.lower() == 'cache_stats':
-            stats = cache.get_cache_stats()
-            print(f"📊 Cache Stats:")
-            print(f"   Active Tool Entries: {stats['tool_cache_active']}")
-            print(f"   Expired Tool Entries: {stats['tool_cache_expired']}")
-            print(f"   Active LLM Entries: {stats['llm_cache_active']}")
-            print(f"   Expired LLM Entries: {stats['llm_cache_expired']}")
-            print(f"   Cache Size: {stats['cache_size_bytes'] / 1024:.1f} KB")
-            continue
-        elif user_input.lower() == 'clear_cache':
-            cache.clear_all()
-            continue
-        elif user_input.lower() == 'clear_expired':
-            cache.clear_expired()
-            continue
+    # Start a new conversation
+    conversation_id = conversation_manager.start_conversation()
+    print(f"📝 Started conversation: {conversation_id[:8]}...\n")
 
-        # Add user message to the conversation state
-        state['messages'].append(HumanMessage(content=user_input))
+    current_conversation_id = conversation_id
 
-        # Run the LangGraph pipeline (LLM + tools) with caching
-        start_time = time.time()
-        state = graph.invoke(state)
-        end_time = time.time()
+    try:
+        while True:
+            user_input = input(f"[{current_conversation_id[:8]}] > ").strip()
 
-        # Print assistant's response with timing
-        print(f"{state['messages'][-1].content}")
-        print(f"⏱️ Response time: {end_time - start_time:.2f}s\n")
+            if not user_input:
+                continue
+
+            if user_input.lower() == 'quit':
+                # End current conversation
+                conversation_manager.end_conversation(current_conversation_id)
+                conv_state_manager.remove_conversation(current_conversation_id)
+                print("Goodbye! 👋")
+                break
+
+            elif user_input.lower() == 'debug':
+                # Debug information
+                conv_messages = conv_state_manager.get_conversation_messages(current_conversation_id)
+                print(f"🐛 Debug Info for {current_conversation_id[:8]}:")
+                print(f"   Messages in memory: {len(conv_messages)}")
+                for i, msg in enumerate(conv_messages[-3:], 1):  # Last 3 messages
+                    msg_type = getattr(msg, 'type', 'unknown')
+                    content = getattr(msg, 'content', str(msg))
+                    print(f"   {i}. [{msg_type}] {content[:50]}...")
+                continue
+
+            elif user_input.lower() == 'active_convs':
+                active_convs = conv_state_manager.get_active_conversations()
+                print(f"🔄 Active Conversations ({len(active_convs)}):")
+                for conv in active_convs:
+                    conv_id = conv['conversation_id'][:8]
+                    last_active = datetime.fromisoformat(conv['last_active']).strftime("%H:%M:%S")
+                    current_indicator = "👆" if conv['conversation_id'] == current_conversation_id else "  "
+                    print(f"   {current_indicator} {conv_id}... [{last_active}] ({conv['message_count']} msgs)")
+                continue
+
+            elif user_input.lower().startswith('switch_conv '):
+                new_conv_id = user_input[12:].strip()
+                # Find full conversation ID from partial match
+                active_convs = conv_state_manager.get_active_conversations()
+                matching_conv = None
+                for conv in active_convs:
+                    if conv['conversation_id'].startswith(new_conv_id) or conv['conversation_id'] == new_conv_id:
+                        matching_conv = conv
+                        break
+
+                if matching_conv:
+                    current_conversation_id = matching_conv['conversation_id']
+                    print(f"🔄 Switched to conversation: {current_conversation_id[:8]}...")
+                else:
+                    print(f"❌ No active conversation found starting with: {new_conv_id}")
+                continue
+
+            elif user_input.lower() == 'new_conv':
+                # Start a new conversation
+                new_conversation_id = conversation_manager.start_conversation()
+                current_conversation_id = new_conversation_id
+                print(f"📝 Started new conversation: {new_conversation_id[:8]}...")
+                continue
+
+            elif user_input.lower() == 'cache_stats':
+                stats = cache.get_cache_stats()
+                print(f"📊 Cache Stats:")
+                print(f"   Active Tool Entries: {stats['tool_cache_active']}")
+                print(f"   Expired Tool Entries: {stats['tool_cache_expired']}")
+                print(f"   Active LLM Entries: {stats['llm_cache_active']}")
+                print(f"   Expired LLM Entries: {stats['llm_cache_expired']}")
+                print(f"   Cache Size: {stats['cache_size_bytes'] / 1024:.1f} KB")
+                continue
+
+            elif user_input.lower() == 'conv_stats':
+                stats = conversation_manager.get_conversation_stats()
+                print(f"📈 Conversation Stats:")
+                print(f"   Total Conversations: {stats['total_conversations']}")
+                print(f"   Active: {stats['active_conversations']}")
+                print(f"   Completed: {stats['completed_conversations']}")
+                print(f"   Total Messages: {stats['total_messages']}")
+                print(f"   Avg Messages/Conversation: {stats['avg_messages_per_conversation']}")
+                print(f"   Cache Hit Rate: {stats['cache_hit_rate']}%")
+                continue
+
+            print(f"[Main] Processing user input: {user_input}")
+
+            # Save user message to database
+            try:
+                conversation_manager.save_message(current_conversation_id, 'user', user_input)
+            except Exception as e:
+                print(f"⚠️ Failed to save user message to DB: {e}")
+
+            # Add user message to conversation-specific state
+            user_message = HumanMessage(content=user_input)
+            conv_state_manager.add_message_to_conversation(current_conversation_id, user_message)
+
+            print(
+                f"[Main] Added message to conversation. Total messages: {len(conv_state_manager.get_conversation_messages(current_conversation_id))}")
+
+            # Create state for this specific conversation
+            state = {
+                'messages': conv_state_manager.get_conversation_messages(current_conversation_id),
+                'conversation_id': current_conversation_id
+            }
+
+            print(f"[Main] Created state with {len(state['messages'])} messages")
+
+            # Run the LangGraph pipeline
+            start_time = time.time()
+
+            try:
+                print("[Main] Invoking multi_conv_graph...")
+                state = graph.invoke(state)
+                print("[Main] Graph invocation completed")
+            except Exception as e:
+                print(f"❌ Graph execution error: {e}")
+                error_message = AIMessage(content="I encountered an error processing your request. Please try again.")
+                conv_state_manager.add_message_to_conversation(current_conversation_id, error_message)
+                print("I encountered an error processing your request. Please try again.")
+                continue
+
+            end_time = time.time()
+
+            # Print assistant's response
+            if state.get('messages') and len(state['messages']) > 0:
+                last_message = state['messages'][-1]
+                print(f"\n{last_message.content}")
+                print(f"⏱️ Response time: {end_time - start_time:.2f}s\n")
+            else:
+                print("⚠️ No response received from the assistant")
+
+    except KeyboardInterrupt:
+        conversation_manager.end_conversation(current_conversation_id)
+        conv_state_manager.remove_conversation(current_conversation_id)
+        print("\n\nConversation saved. Goodbye! 👋")
+    except Exception as e:
+        print(f"❌ Unexpected error in main loop: {e}")
+        conversation_manager.end_conversation(current_conversation_id)
+        conv_state_manager.remove_conversation(current_conversation_id)
+
