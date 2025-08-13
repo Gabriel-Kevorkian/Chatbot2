@@ -32,11 +32,11 @@ from tools import (
 # ===================== CACHING SYSTEM =====================
 
 class ChatbotCache:
-    def __init__(self, cache_dir="chatbot_cache", db_name="cache.db", expire_hours=24):
+    def __init__(self, cache_dir="chatbot_cache", db_name="cache.db", expire_minutes=5):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
         self.db_path = self.cache_dir / db_name
-        self.expire_hours = expire_hours
+        self.expire_minutes = expire_minutes
         self.lock = threading.Lock()
         self._init_db()
 
@@ -143,7 +143,7 @@ class ChatbotCache:
         """Store tool result in cache"""
         cache_key = self._generate_cache_key(tool_name, **kwargs)
         created_at = datetime.now().isoformat()
-        expires_at = (datetime.max).isoformat()
+        expires_at = (datetime.now() + timedelta(minutes=self.expire_minutes)).isoformat()
 
 
         with self.lock:
@@ -178,7 +178,7 @@ class ChatbotCache:
         """Store LLM response in cache"""
         message_hash = self._generate_message_hash(messages)
         created_at = datetime.now().isoformat()
-        expires_at = (datetime.max).isoformat()
+        expires_at = (datetime.now() + timedelta(minutes=self.expire_minutes)).isoformat()
 
         with self.lock:
             with sqlite3.connect(self.db_path) as conn:
@@ -257,7 +257,7 @@ class CachedToolWrapper:
 
 
 # Initialize cache system
-cache = ChatbotCache(expire_hours=24)  # Cache for 24 hours
+cache = ChatbotCache(expire_minutes=5)
 
 # Initialize the LLM model
 llm = init_chat_model("qwen2.5:7b-instruct-q4_K_M", model_provider="ollama")
@@ -350,7 +350,7 @@ IMPORTANT: You must NOT generate or infer any product information on your own.
 You can only repeat and explain the data that comes directly from the tools.  
 If the tools return no data, respond only with:  
 "I'm sorry, I couldn't find any matching products in our database."
-If you couldn't found any products in the database using the query_products tool, use directly the semantic_searchtool.
+If you couldn't found any products in the database using the query_products tool, use directly the semantic_search_tool.
 Do NOT make up product names, descriptions, or prices under any circumstances.
 
 Your goal is to use tools correctly and only reply based on what the tools return.
@@ -488,7 +488,7 @@ def tools_node(state):
         print("🔧 Raw tool response:", tool_response_data)
 
         # Only try to parse as JSON for tools that return JSON (not semantic_search)
-        if last_tool_call and last_tool_call["name"] != "semantic_search_tool":
+        if last_tool_call and last_tool_call["name"] != "semantic_search_tool" or last_tool_call["name"] != "get_product_details":
             if isinstance(tool_response_data, str):
                 try:
                     tool_response_data = json.loads(tool_response_data)
